@@ -57,7 +57,7 @@ class Queries(object):
         Make a request to the REST API
         """
         # Reduced retries to prevent infinite hangs
-        for _ in range(10):
+        for _ in range(67):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
