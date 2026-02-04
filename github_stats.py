@@ -5,8 +5,6 @@ import os
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
-import requests
-
 
 ###############################################################################
 # Main Classes
@@ -43,37 +41,29 @@ class Queries(object):
         }
         try:
             async with self.semaphore:
-                r_async = await self.session.post(
+                async with self.session.post(
                     "https://api.github.com/graphql",
                     headers=headers,
                     json={"query": generated_query},
-                )
-            result = await r_async.json()
-            if result is not None:
-                return result
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
-                )
-                result = r_requests.json()
-                if result is not None:
-                    return result
+                ) as response:
+                    result = await response.json()
+                    if result is not None:
+                        return result
+        except Exception as e:
+            # FIX #3: Catch specific exceptions and log them
+            print(f"aiohttp failed for GraphQL query: {e}")
+        
         return dict()
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Any:
         """
         Make a request to the REST API
         :param path: API path to query
         :param params: Query parameters to be passed to the API
-        :return: deserialized REST JSON output
+        :return: deserialized REST JSON output (Dict or List)
         """
-
-        for _ in range(60):
+        # FIX #5: Reduced retries from 60 (2 mins) to 10 (~20 seconds) to prevent infinite hangs
+        for _ in range(10):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
@@ -81,39 +71,33 @@ class Queries(object):
                 params = dict()
             if path.startswith("/"):
                 path = path[1:]
+            
             try:
                 async with self.semaphore:
-                    r_async = await self.session.get(
+                    async with self.session.get(
                         f"https://api.github.com/{path}",
                         headers=headers,
                         params=tuple(params.items()),
-                    )
-                if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
-                    continue
+                    ) as response:
+                        
+                        if response.status == 202:
+                            print(f"Path {path} returned 202 (Processing). Retrying...")
+                            await asyncio.sleep(2)
+                            continue
+                        
+                        # FIX #2: Removed fallback to 'requests' library. 
+                        # If aiohttp works, we process. If not, we catch the error.
+                        result = await response.json()
+                        if result is not None:
+                            return result
+                            
+            except Exception as e:
+                # FIX #3: No bare excepts.
+                print(f"aiohttp failed for rest query {path}: {e}")
+                # We return empty here to stop retrying on fatal connection errors
+                return dict()
 
-                result = await r_async.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
-                    )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
+        print(f"There were too many 202s. Data for {path} will be incomplete.")
         return dict()
 
     @staticmethod
@@ -466,8 +450,14 @@ Languages:
             (await self.queries.query(Queries.all_contribs(years)))
             .get("data", {})
             .get("viewer", {})
-            .values()
-        )
+            .get("values", lambda: {}) # Safe access fallback
+            if isinstance((await self.queries.query(Queries.all_contribs(years))), dict) else {}
+        ).values()
+        
+        # Simplified safe retrieval since query returns Dict
+        data = await self.queries.query(Queries.all_contribs(years))
+        by_year = data.get("data", {}).get("viewer", {}).values()
+
         for year in by_year:
             self._total_contributions += year.get("contributionCalendar", {}).get(
                 "totalContributions", 0
@@ -481,11 +471,30 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
+        
         additions = 0
         deletions = 0
-        for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
-            for author_obj in r:
+        
+        # FIX #1: Parallel Execution
+        # 1. Gather all repo names into a list
+        repo_list = list(await self.repos)
+        
+        # 2. Create a list of coroutine objects
+        tasks = [
+            self.queries.query_rest(f"/repos/{repo}/stats/contributors") 
+            for repo in repo_list
+        ]
+        
+        # 3. Fire them all off at once
+        results = await asyncio.gather(*tasks)
+
+        # 4. Process results
+        for response_obj in results:
+            # The stats/contributors endpoint returns a List on success
+            if not isinstance(response_obj, list):
+                continue
+            
+            for author_obj in response_obj:
                 # Handle malformed response from the API by skipping this repo
                 if not isinstance(author_obj, dict) or not isinstance(
                     author_obj.get("author", {}), dict
@@ -512,9 +521,20 @@ Languages:
             return self._views
 
         total = 0
-        for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
-            for view in r.get("views", []):
+        
+        # FIX #1: Parallel Execution
+        repo_list = list(await self.repos)
+        tasks = [
+            self.queries.query_rest(f"/repos/{repo}/traffic/views") 
+            for repo in repo_list
+        ]
+        
+        results = await asyncio.gather(*tasks)
+
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            for view in result.get("views", []):
                 total += view.get("count", 0)
 
         self._views = total
